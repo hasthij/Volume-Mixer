@@ -4,15 +4,10 @@
 //! shared across whatever thread a Tauri command happens to run on, so
 //! everything is funneled through a channel instead.
 //!
-//! NOTE: this is hand-written against the `windows` crate's typical 0.58
-//! surface for these interfaces. It has not been compiled in this
-//! environment (no Rust toolchain available here) — if `cargo check` flags
-//! a signature mismatch, check docs.rs/windows for the installed version;
-//! COM binding signatures occasionally shift between minor versions.
 
 use super::{AudioBackend, AudioSessionInfo};
 use std::collections::HashMap;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::core::Interface;
@@ -57,7 +52,9 @@ impl AudioBackend for WindowsAudioBackend {
         if self.tx.send(Cmd::List(reply_tx)).is_err() {
             return Vec::new();
         }
-        reply_rx.recv().unwrap_or_default()
+        // never block the caller for long: this answers the overlay's app
+        // menu, and a stalled audio thread must not freeze the UI with it
+        reply_rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default()
     }
 
     fn set_volume(&self, id: &str, volume01: f32) {
@@ -77,14 +74,16 @@ impl AudioBackend for WindowsAudioBackend {
 /// `ISimpleAudioVolume`s that all need to move together.
 type Cache = HashMap<String, Vec<ISimpleAudioVolume>>;
 
-/// How often a `SetVolume`/`SetMute` call forces a full re-enumeration even
-/// on a cache *hit*. A session that gets torn down and recreated (Discord
-/// does this constantly — its audio session comes and goes with voice
-/// calls) leaves behind a stale, silently-no-op'ing COM reference; only
-/// refreshing on a miss never notices that. A time-based refresh bounds
-/// how stale the cache can get without re-enumerating on every single
-/// knob tick (which fires at 20Hz per assigned channel).
-const MAX_CACHE_AGE: Duration = Duration::from_millis(1500);
+/// How often the session list is re-scanned. A session that gets torn
+/// down and recreated (Discord does this constantly — its audio session
+/// comes and goes with voice calls) leaves behind a stale, silently
+/// no-op'ing COM reference, and a newly started app has no entry at all;
+/// a periodic re-scan picks both up. Scanning is far too slow to do per
+/// command: the serial thread sends a volume for every knob at 20 Hz, so
+/// re-scanning on each one (which is what used to happen for any assigned
+/// app that wasn't running) let the queue grow without bound — volume
+/// changes landed up to a minute late and the app menu froze the UI.
+const RESCAN_EVERY: Duration = Duration::from_millis(1500);
 
 fn audio_thread(rx: mpsc::Receiver<Cmd>) {
     unsafe {
@@ -92,47 +91,73 @@ fn audio_thread(rx: mpsc::Receiver<Cmd>) {
     }
 
     let mut cache: Cache = HashMap::new();
-    let mut cache_built_at = Instant::now() - MAX_CACHE_AGE;
+    let mut scanned_at: Option<Instant> = None;
+    // what the knobs / mute state want, per app, and what was last applied
+    let mut want_vol: HashMap<String, f32> = HashMap::new();
+    let mut want_mute: HashMap<String, bool> = HashMap::new();
+    let mut applied_vol: HashMap<String, f32> = HashMap::new();
+    let mut applied_mute: HashMap<String, bool> = HashMap::new();
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::List(reply) => {
-                let sessions = unsafe { list_all_sessions(&mut cache) };
-                cache_built_at = Instant::now();
-                let _ = reply.send(sessions);
+    loop {
+        // wait for work, but wake up anyway to re-scan now and then so a
+        // restarted app gets its volume back even if no knob moves
+        let first = match rx.recv_timeout(RESCAN_EVERY) {
+            Ok(cmd) => Some(cmd),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        // coalesce: drain everything queued and keep only the latest value
+        // per app, so a burst of knob frames costs one COM call, not dozens
+        let mut lists = Vec::new();
+        for cmd in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            match cmd {
+                Cmd::List(reply) => lists.push(reply),
+                Cmd::SetVolume(id, vol) => {
+                    want_vol.insert(id, vol);
+                }
+                Cmd::SetMute(id, muted) => {
+                    want_mute.insert(id, muted);
+                }
             }
-            Cmd::SetVolume(id, vol) => unsafe {
-                apply(&mut cache, &mut cache_built_at, &id, |v| {
-                    let _ = v.SetMasterVolume(vol, std::ptr::null());
-                });
-            },
-            Cmd::SetMute(id, muted) => unsafe {
-                apply(&mut cache, &mut cache_built_at, &id, |v| {
-                    let _ = v.SetMute(BOOL::from(muted), std::ptr::null());
-                });
-            },
+        }
+
+        let due = scanned_at.map_or(true, |t| t.elapsed() >= RESCAN_EVERY);
+        if !lists.is_empty() || due {
+            let sessions = unsafe { list_all_sessions(&mut cache) };
+            scanned_at = Some(Instant::now());
+            // fresh COM references: re-apply everything to them
+            applied_vol.clear();
+            applied_mute.clear();
+            for reply in lists {
+                let _ = reply.send(sessions.clone());
+            }
+        }
+
+        for (id, &vol) in &want_vol {
+            if applied_vol.get(id) == Some(&vol) {
+                continue;
+            }
+            if let Some(list) = cache.get(id) {
+                for v in list {
+                    let _ = unsafe { v.SetMasterVolume(vol, std::ptr::null()) };
+                }
+                applied_vol.insert(id.clone(), vol);
+            }
+        }
+        for (id, &muted) in &want_mute {
+            if applied_mute.get(id) == Some(&muted) {
+                continue;
+            }
+            if let Some(list) = cache.get(id) {
+                for v in list {
+                    let _ = unsafe { v.SetMute(BOOL::from(muted), std::ptr::null()) };
+                }
+                applied_mute.insert(id.clone(), muted);
+            }
         }
     }
 
     unsafe { CoUninitialize() };
-}
-
-unsafe fn apply<F: Fn(&ISimpleAudioVolume)>(
-    cache: &mut Cache,
-    cache_built_at: &mut Instant,
-    id: &str,
-    f: F,
-) {
-    let stale = cache_built_at.elapsed() >= MAX_CACHE_AGE;
-    if stale || !cache.contains_key(id) {
-        let _ = list_all_sessions(cache);
-        *cache_built_at = Instant::now();
-    }
-    if let Some(sessions) = cache.get(id) {
-        for v in sessions {
-            f(v);
-        }
-    }
 }
 
 unsafe fn get_session_manager() -> windows::core::Result<IAudioSessionManager2> {

@@ -31,9 +31,11 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> AppConfig {
     state.config.get()
 }
 
+/// async so it runs off the main thread: a sync command blocks the window
+/// event loop until it returns, which froze both windows while it waited
 #[tauri::command]
-pub fn list_audio_sessions(state: State<'_, Arc<AppState>>) -> Vec<AudioSessionInfo> {
-    state.audio.list_sessions()
+pub async fn list_audio_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<AudioSessionInfo>, ()> {
+    Ok(state.audio.list_sessions())
 }
 
 #[tauri::command]

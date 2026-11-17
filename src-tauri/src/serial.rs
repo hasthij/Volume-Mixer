@@ -15,6 +15,10 @@ const REPEAT_MS: u64 = 340;
 /// something. A quick click (release before the first step) still closes.
 const CYCLE_STEP_MS: u64 = 1000;
 const BAUD_RATE: u32 = 115_200;
+/// No valid frame for this long (stalled USB, board reset, unplug) and the
+/// button is treated as released — otherwise the last "1" sticks forever
+/// and the overlay sits in a hold that never ends.
+const STALE_MS: u64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum XAxis {
@@ -136,6 +140,31 @@ fn hold_info(nav: &NavState, frame: &HwFrame, now: Instant, expanded: bool) -> O
         next: stage_name(stage_at(next_step)),
         current: nav.cycle_step.map(|s| stage_name(stage_at(s))),
     })
+}
+
+/// The button state only flips once two frames in a row agree, so a single
+/// noisy "1" (or "0") from the firmware can't start or end a hold.
+fn debounce_btn(raw: bool, prev_raw: &mut bool, stable: &mut bool) -> bool {
+    if raw == *prev_raw {
+        *stable = raw;
+    }
+    *prev_raw = raw;
+    *stable
+}
+
+/// Drops any in-flight press: used when frames stop arriving, so a hold
+/// never outlives the data that started it.
+fn release_button(nav: &mut NavState) {
+    nav.btn_prev = false;
+    nav.press_started_at = None;
+    nav.cycle_step = None;
+    nav.opened_this_press = false;
+}
+
+fn clear_hold(app: &AppHandle, state: &Arc<AppState>, nav: &mut NavState) {
+    release_button(nav);
+    state.runtime.lock().unwrap_or_else(|e| e.into_inner()).hold = None;
+    state.emit(app);
 }
 
 fn stage_index(stage: CycleStage) -> usize {
@@ -439,7 +468,8 @@ impl SerialManager {
 
     pub fn connect(&self, app: AppHandle, state: Arc<AppState>, port_name: String) -> Result<(), String> {
         let port = serialport::new(&port_name, BAUD_RATE)
-            .timeout(Duration::from_millis(500))
+            // short, so a stalled stream is noticed (see STALE_MS)
+            .timeout(Duration::from_millis(100))
             .open()
             .map_err(|e| format!("couldn't open {port_name}: {e}"))?;
 
@@ -463,6 +493,8 @@ impl SerialManager {
                 // byte, and the junk an Arduino sends while the port opens or
                 // the board resets would drop the connection
                 let mut buf: Vec<u8> = Vec::with_capacity(64);
+                let mut last_frame = Instant::now();
+                let (mut btn_raw, mut btn_stable) = (false, false);
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -472,7 +504,9 @@ impl SerialManager {
                         Ok(_) => {
                             if buf.last() == Some(&b'\n') {
                                 let line = String::from_utf8_lossy(&buf);
-                                if let Some(frame) = parse_line(&line) {
+                                if let Some(mut frame) = parse_line(&line) {
+                                    last_frame = Instant::now();
+                                    frame.btn = debounce_btn(frame.btn, &mut btn_raw, &mut btn_stable);
                                     process_frame(&app, &state, &mut nav, frame);
                                 }
                                 buf.clear();
@@ -484,11 +518,18 @@ impl SerialManager {
                             if buf.len() > 256 {
                                 buf.clear();
                             }
+                            if btn_stable && last_frame.elapsed() >= Duration::from_millis(STALE_MS) {
+                                btn_raw = false;
+                                btn_stable = false;
+                                clear_hold(&app, &state, &mut nav);
+                            }
                             continue;
                         }
                         Err(_) => break,
                     }
                 }
+                release_button(&mut nav);
+                state.runtime.lock().unwrap_or_else(|e| e.into_inner()).hold = None;
                 if !stop.load(Ordering::Relaxed) {
                     // thread is exiting because of a real error/unplug, not
                     // because a newer connect() superseded it
@@ -595,6 +636,29 @@ mod tests {
         assert!(h.current.is_none());
         assert!((h.progress - 0.5).abs() < 0.01);
         assert!(hold_info(&nav, &idle(false), ms(t0, 500), true).is_none());
+    }
+
+    #[test]
+    fn button_needs_two_matching_frames() {
+        let (mut raw, mut stable) = (false, false);
+        assert!(!debounce_btn(true, &mut raw, &mut stable), "one noisy 1 is ignored");
+        assert!(!debounce_btn(false, &mut raw, &mut stable));
+        assert!(!debounce_btn(true, &mut raw, &mut stable));
+        assert!(debounce_btn(true, &mut raw, &mut stable), "two in a row press");
+        assert!(debounce_btn(false, &mut raw, &mut stable), "one noisy 0 keeps it held");
+        assert!(!debounce_btn(false, &mut raw, &mut stable), "two in a row release");
+    }
+
+    #[test]
+    fn released_button_ends_the_hold() {
+        let mut nav = NavState::new();
+        let t0 = Instant::now();
+        step_button(&mut nav, &idle(true), t0, true, CycleStage::Normal);
+        release_button(&mut nav);
+        assert!(hold_info(&nav, &idle(true), ms(t0, 500), true).is_none());
+        // the next real press starts fresh instead of continuing a ghost hold
+        assert!(matches!(step_button(&mut nav, &idle(true), ms(t0, 600), true, CycleStage::Normal), ButtonAction::None));
+        assert!(nav.press_started_at == Some(ms(t0, 600)));
     }
 
     #[test]
