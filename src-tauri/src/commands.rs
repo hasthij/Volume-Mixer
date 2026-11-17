@@ -75,12 +75,7 @@ pub fn assign_channel(
     state.config.update(|cfg| {
         cfg.banks[bank][channel].app_id = session_id;
         cfg.banks[bank][channel].app_name = display_name;
-        cfg.muted[bank][channel] = false;
     });
-    {
-        let mut runtime = state.runtime.lock().unwrap_or_else(|e| e.into_inner());
-        runtime.muted[bank][channel] = false;
-    }
     state.emit(&app);
     Ok(())
 }
